@@ -1,0 +1,25 @@
+# Smoke-test config: Blender lego, small budget for a 6 GB RTX 2060
+iterations: 3_000
+densify_from: 300
+densify_until: 2_400
+
+dataset: "blender"
+data_path: "../data"
+scene: "lego"
+alpha_format_on_disk: "straight"
+downsample: [4, 2]
+downsample_iterations: [0, 1_000]
+is_pinhole: true
+eval: true
+
+init_type: "random_bounded"
+init_points: 10_000
+final_points: 30_000
+bkgd_color: [1.0, 1.0, 1.0]
+
+points_lr_init: 1e-3
+points_lr_final: 5e-5
+density_lr_init: 1e0
+density_lr_final: 1e0
+radii_lr_init: 5e-5
+radii_lr_final: 5e-6
