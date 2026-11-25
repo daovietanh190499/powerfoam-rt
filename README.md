@@ -1,285 +1,197 @@
-# Power Foam: Unifying Real-Time Differentiable Ray Tracing and Rasterization
+# powerfoam_rt
 
-## Shrisudhan Govindarajan\*, Daniel Rebain\*, Dor Verbin, Kwang Moo Yi, Anish Prabhu, Andrea Tagliasacchi
+A **ray-traced, differentiable** version of the [Power Foam](https://powerfoam.github.io/) cell model
+([arXiv:2604.24994](https://arxiv.org/abs/2604.24994)), with the main ideas of
+[VoroTracing](https://github.com/zenseact/VoroTracing) ([arXiv:2608.17682](https://arxiv.org/abs/2608.17682)).
 
-<div align="center">
+It started as a copy of the official Power Foam code. The rasterizer and its losses were removed and only the
+ray-tracing renderer is kept, written in [NVIDIA Warp](https://github.com/NVIDIA/warp) with a **hand-written
+backward pass**. Training and inference are both ray tracing.
 
-[![Project Page](https://img.shields.io/badge/Project-Page-blue?style=for-the-badge&logo=githubpages&logoColor=white)](https://powerfoam.github.io/)
-[![arXiv](https://img.shields.io/badge/arXiv-Paper-b31b1b?style=for-the-badge&logo=arxiv&logoColor=white)](https://arxiv.org/abs/2604.24994)
+The code is a research prototype, developed and tested only on the Mip-NeRF 360 **garden** scene at 1/8
+resolution on one RTX 2060 (6 GB).
 
-</div>
+## What the model is
 
-This repository contains the official implementation of **Power Foam: Unifying Real-Time Differentiable Ray Tracing and Rasterization**. It provides scripts for training, evaluation and benchmarking, plus an interactive viewer that can be used both to inspect trained checkpoints and to watch a model converge live during training. The code includes scripts for training and evaluation, as well as a real-time viewer that can be used to visualize trained models, or optionally to observe the progression of models as they train. Everything in this repository is non-final and subject to change as the project is still being actively developed.
+Every cell `i` has a site `p_i`, a radius `r_i`, a density `sigma_i = exp(rho_i)` and two octahedral textures.
 
-Warning: this is an organic, free-range research codebase, and should be treated with the appropriate care when integrating it into any other software.
+* **Geometry (Power Foam).** Cell `i` is the power cell of the site (power weight `r_i^2`) clipped by its own sphere
+  `|x - p_i| <= r_i`. A neighbour `j` only clips cell `i` through the face `n.x = h` with `n = p_j - p_i` and
+  `h = (|n|^2 + r_i^2 - r_j^2) / 2`. That face cuts the sphere iff the spheres overlap, so the **Cech complex**
+  (sphere overlap, built with a BVH on the GPU, radii not inflated) gives exactly `power cell ∩ sphere`.
+* **Appearance (VoroTracing).** Per cell, an 8x8 RGB *diffuse* octahedral texture indexed by the direction from
+  the site to the point where the ray enters the cell, plus an 8x8 *specular* texture indexed by the view direction
+  (a residual, regularised to stay small). Colour = `sigmoid(diffuse + specular)`, both bilinearly filtered.
+  The texture coordinate is not differentiated (same as VoroTracing). SH is no longer used.
+* **Volume rendering.** `alpha_i = 1 - exp(-sigma_i * dt_i)`, `C += T alpha_i c_i`, `T *= 1 - alpha_i`,
+  `C += T * background`.
 
-## Getting started
+## What was changed compared with the official Power Foam
 
-Start by cloning the repository:
+1. **Ray-traced training, no rasterizer.**
+   Each ray queries the BVH of the spheres, computes the interval `[t_near, t_far]` of every hit cell
+   (sphere ∩ Cech faces), keeps the `max_cells` (96) nearest ones by `t_near` (cells are disjoint, so this is the depth
+   order) and composites them front to back. No walk during training, so the Cech complex is enough and no Delaunay
+   triangulation is needed.
+2. **Hand-written backward.**
+   Uses the "rest of the ray" identity with float64 accumulation. Gradients: density, both textures, sites and radii
+   (through `t_near` / `t_far`, each being a sphere root or a Cech face).
+3. **Losses.**
+   `L2 + 0.2 (1 - SSIM)` on the image, an **interpenetration loss** `sum_j max(0, r_i + r_j - d_ij)^2` over Cech
+   neighbours (weight `1e-4`, exponentially decayed to `1e-7`; it keeps the Cech degree and the speed under control),
+   and the **distortion loss** below. Power Foam's densify / prune (`resample`) is kept.
+4. **Exponential density** `sigma = exp(rho)` (VoroTracing 5.4). `d loss / d rho` does not depend on the cell size.
+   `rho` is initialised to `log(density_init)`, lr `0.1 -> 0.01` (the old softplus lr `1.0` must not be used with it;
+   all configs in `configs/` were updated).
+5. **Distortion loss** (Mip-NeRF 360) on the per-ray weights `w_k = T_k alpha_k`, with `s(t) = 1 - 1/(1+t)`:
+   `sum_{k,l} w_k w_l |s_k - s_l| + 1/3 sum_k w_k^2 ds_k`. Cells of a ray are disjoint, so the double sum is
+   computed in O(K) with prefix sums. Forward and backward (through `w`, `T`, `t_near`, `t_far`) are in
+   `raytrace.py`; the weight is `distortion_weight` (default `0.01`, `0.02` in `garden_smoke.yaml`). It is injected
+   in the backward kernel, so it is not a term of `loss` in `train.py` (its value is shown as `dist` in the progress bar).
+6. **Early ray termination** `t_thresh_late` (default `1e-2`) from iteration `t_thresh_after` (default 3000) on,
+   instead of `t_thresh` (`1e-3`). It stays active at inference.
+7. **Low-contribution skip at inference** (`skip_thresh`, default `1e-3`): cells with `T alpha` below it still update
+   `T` and the ray continues, but the texture loads and the sigmoid are skipped. Used only without gradients.
+8. **Inference without BVH and Cech** (`powerfoam/walk.py`): the exact adjacency of the weighted Delaunay
+   triangulation is computed once with qhull (`build_exact_adjacency()`, ~9 s for 300k cells), then a ray starts in the
+   power cell that contains the camera and walks from cell to cell through the exit face. The cells and the image
+   are the same as in training.
+
+## Results (garden, 1/8 resolution, 5000 iterations, 300k cells, RTX 2060)
+
+| Model | PSNR | SSIM | LPIPS | Train time |
+|---|---|---|---|---|
+| Power Foam original (1 texel), reference | 25.32 | 0.719 | 0.318 | - |
+| SH + Cech + interpenetration | 23.73 | 0.631 | 0.382 | 17 min |
+| **octahedral textures + exp density + distortion + early termination** | **26.17** | **0.785** | **0.204** | 17 min |
+
+Inference speed of the last model (test cameras, 648x420, 300k cells):
+
+| Renderer | PSNR | ms / frame | FPS |
+|---|---|---|---|
+| BVH + Cech (training tracer) | 26.168 | 290 | 3.4 |
+| qhull adjacency + walk (no BVH) | 26.167 | 22.4 | 44.7 |
+
+Notes and limits:
+
+* The textures are by far the largest gain (about +2.5 dB over SH). With the SH model, exp density + distortion alone
+  made things worse in this short schedule (fewer cells could become exactly transparent).
+* About 32% of the cells have `1 - exp(-2 r sigma) > 0.9` (9% before), i.e. the opacity is more bimodal.
+* The low-contribution skip does not change PSNR (26.169 -> 26.168) but gives **no speed-up here**. In the BVH tracer
+  the cost is the BVH query and the cell clipping (done for all nearest cells before compositing); in the walk
+  it is the cell stepping. Early termination also does not help the BVH tracer for the same reason.
+* A single run per setting, one scene, one seed. Nothing was tuned on the test views beyond what is listed here,
+  but the numbers are not averaged over scenes or seeds.
+* Training memory is dominated by the textures (`384` floats per cell plus Adam state): about 5 GB of VRAM at
+  300k cells on the 6 GB card.
+
+## Installation
+
+Linux, Python 3.10+, CUDA 12.x GPU (compute capability 7.0+). Reference build: `torch==2.9.1+cu128`,
+`warp-lang==1.10.0`.
 
 ```bash
-git clone https://github.com/theialab/powerfoam.git
-cd powerfoam
-```
-
-You will need a Linux environment with **Python 3.10**, **CUDA 12.x** and a CUDA-compatible GPU of **Compute Capability 7.0 or higher**. The reference build is `torch==2.9.1+cu128`, `warp-lang==1.10.0` on CUDA 12.8.
-
-After creating your Python virtual environment, install PyTorch matching your CUDA build (cu128 below):
-
-```bash
-conda create -n powerfoam python=3.11 -y
-conda activate powerfoam
-
-pip install torch==2.9.1 torchvision==0.24.1 \
-  --index-url https://download.pytorch.org/whl/cu128
-```
-
-Then install the rest of the Python dependencies:
-
-```bash
+conda create -n powerfoam python=3.11 -y && conda activate powerfoam
+pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt
 ```
 
-### Optional: Metric3D normal/depth supervision
+The viewer and Metric3D parts of the original code are not included in this repository.
 
-If you plan to use Metric3D-derived normals (`--use_metric3d True`, optionally combined with `--normal_supervision`), install the extra dependencies on top of the base requirements:
+## Data
 
-```bash
-pip install -r metric3d_requirements.txt
-```
-
-The Metric3D ViT-Large checkpoint is downloaded from `torch.hub` on first use (`yvanyin/metric3d`).
-
-### Optional: Viewer
-
-The interactive viewer (`view.py`, and `--viewer` during training) needs `imgui-bundle`, `glfw` and `PyOpenGL`. They are listed in `requirements.txt` and installed by the command above.
-
-## Dataset layout
-
-Power Foam supports two dataset types, selected by the `dataset:` field in the yaml config:
-
-| Config value | Reader                                                   |
-| ------------ | -------------------------------------------------------- |
-| `colmap`     | COLMAP `images/` + `sparse/0/` (DTU, MipNeRF-360, DL3DV) |
-| `blender`    | Synthetic Blender (`transforms_*.json` + `*/r_*.png`)    |
-
-We have tested our model on the [Mip-NeRF 360](https://jonbarron.info/mipnerf360/) and [DL3DV](https://huggingface.co/datasets/DL3DV/DL3DV-10K-Sample) datasets.
-
-Place each scene under `<data_path>/<scene>/`, e.g. `data/mipnerf360/garden/{images,sparse}/`. If your raw data is just a folder of images, you can run COLMAP on it via:
-
-```bash
-python prepare_colmap_data.py --data_dir data/your_own_data
-```
-
-This creates `data/your_own_data/sparse/0/{cameras,images,points3D}.bin` so the COLMAP loader can pick it up.
-
-When `--use_metric3d True` is passed, the dataset reader also expects (or auto-creates on first run) a sibling `metric3d/` directory containing per-image `.pt` files with predicted depth, normals and confidence.
-
-## Configuration files
-
-Per-dataset defaults live under `configs/`:
+COLMAP format, e.g. Mip-NeRF 360:
 
 ```
-configs/dl3dv.yaml
-configs/mipnerf360_indoor.yaml
-configs/mipnerf360_outdoor.yaml
-configs/dtu.yaml
+data/mipnerf360/garden/{images,images_2,images_4,images_8,sparse/0}
 ```
 
-Add your own `configs/<dataset>.yaml` for new datasets — copy one of the shipped files and edit `dataset:`, `data_path:`, `scene:` and any optimisation overrides.
-
-Every entry can also be overridden from the command line, e.g. `--scene garden`, `--iterations 30000`. The full schema is defined in `configs/__init__.py` (`Params` dataclass).
-
-> **Camera model default**
-> For the standard datasets shipped in `configs/`, `is_pinhole: true`. The rasterizer therefore uses the fast pinhole pipeline. **If your dataset has a non-pinhole camera (fisheye, distortion, etc.), pass `is_pinhole: false`** in your config file so the renderer switches to the generic precomputed-cone pipeline.
+`data_path` in the config is relative to where you start `train.py`
+(`configs/garden_smoke.yaml` uses `../data/mipnerf360`). For your own images, run
+`python prepare_colmap_data.py --data_dir data/your_own_data` first.
 
 ## Training
 
-Training is launched with:
+```bash
+python train.py -c configs/garden_smoke.yaml --experiment_name garden_rt_oct
+```
+
+`garden_smoke.yaml` is the reduced setting used for the results above (1/8 images, 5000 iterations, 100k -> 300k
+cells, held-out test views). The other files in `configs/` are the original Power Foam configs with the density lr
+fixed for the exponential density; they were **not** run with this code. Any field can be overridden on the command line
+(`--iterations 10000 --distortion_weight 0.05`). The full list is in `configs/__init__.py`.
+
+Main options of this version:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `oct_res`, `spec_res` | 8, 8 | diffuse / specular octahedral texture resolution |
+| `attr_lr_init`, `attr_lr_final` | 2e-2, 5e-4 | texture learning rate |
+| `specular_start` | 1000 | the specular lr ramps up as `(it / start)^2` |
+| `specular_reg_weight`, `diffuse_mean_pull_weight` | 1e-2, 5e-3 | pull specular to 0 / diffuse texels to their per-cell mean |
+| `density_init` | 0.1 | initial `sigma` (`rho = log sigma`) |
+| `density_lr_init`, `density_lr_final` | per config (0.1, 0.01) | lr of `rho` |
+| `distortion_weight` | 0.01 | distortion loss weight, `0` disables it |
+| `t_thresh`, `t_thresh_late`, `t_thresh_after` | 1e-3, 1e-2, 3000 | ray termination threshold, and its late value |
+| `skip_thresh` | 1e-3 | inference-only low-contribution skip |
+| `max_cells` | 96 | nearest cells kept per ray |
+| `interpenetration_weight` | 1e-4 | interpenetration loss weight |
+
+Outputs go to `output/<experiment_name>/`: `config.yaml`, `model.pt`, `log.txt` (test PSNR/SSIM every
+`test_every` iterations), `metrics.txt` (final PSNR / SSIM / LPIPS and train time), `test/` (renders).
+
+## Inference, evaluation, benchmark
 
 ```bash
-python train.py -c configs/<config_file>.yaml
+# test metrics of a saved model (BVH + Cech renderer; --fresh recomputes the Cech complex)
+python evaluate.py output/garden_rt_oct
+
+# FPS: BVH + Cech renderer, then the qhull-adjacency walk renderer (no BVH)
+python benchmark_fps.py output/garden_rt_oct
 ```
 
-where `<config_file>` is one of the shipped files in `configs/` or your own. You can optionally include the `--viewer` flag to train interactively, or use `view.py` to inspect saved checkpoints.
+From code:
+
+```python
+model.build_exact_adjacency()                 # qhull, once (a few seconds for 300k cells)
+with torch.no_grad():
+    rgb = model.forward_walk(camera, bg)      # (H, W, 3), no BVH / Cech
+    rgb, alpha = model.forward(camera, bg)    # BVH + Cech tracer
+```
+
+`load_pt` switches the tracer to `t_thresh_late`, since the model was trained with it.
+`analyze.py` prints radii / density / texture statistics and train vs. test PSNR of a saved model.
+`compare.py` writes side-by-side images against the original Power Foam output; it expects the original repository
+next to this one (`../powerfoam-main/output/garden_powerfoam`).
+
+## Tests
 
 ```bash
-# Train MipNeRF-360 garden with the defaults from configs/mipnerf360_outdoor.yaml
-python train.py -c configs/mipnerf360_outdoor.yaml
-
-# Train with the live viewer attached
-python train.py -c configs/mipnerf360_outdoor.yaml --viewer
+python tests/test_distortion.py
 ```
 
-Outputs are written to `output/<experiment_name>/` and contain:
+Finite-difference check of the distortion-loss gradient (points, radii, density), of the photometric gradient of
+density and both textures, and of the low-contribution skip. The photometric gradient of points / radii is not
+finite-difference tested, because the texture coordinate depends on them and is not differentiated.
+The earlier version of the tracer (SH) was checked to give the same image and gradients as an exact-adjacency
+walk; that test was removed together with SH.
 
-- `config.yaml` — frozen copy of all CLI args
-- `model.pt`    — periodic checkpoint
-- `points.ply`  — point cloud snapshot
-- `test/`       — composed RGB / normal / depth previews
-- TensorBoard event files (`tensorboard --logdir output/<experiment>`)
+## Layout
 
-## Evaluation
-
-The standard test metrics can be computed with:
-
-```bash
-python test.py -c output/<checkpoint_directory>/config.yaml
+```
+train.py                    training loop
+evaluate.py, benchmark_fps.py, analyze.py, compare.py
+powerfoam/raytrace.py       BVH + Cech tracer: forward, backward, distortion loss, textures (Warp)
+powerfoam/walk.py           inference walk on the exact (qhull) adjacency
+powerfoam/scene.py          parameters, densify / prune, optimisers, save / load
+powerfoam/bvh.py            sphere BVH and Cech complex construction
+powerfoam/geometry.py       Morton sort, interpenetration loss
+powerfoam/exact_adj.py      qhull weighted Delaunay edges
+configs/                    configs (garden_smoke.yaml is the one that was run)
+tests/test_distortion.py
 ```
 
-## Benchmarking
+## Credits
 
-Rendering speed can be computed with:
-
-```bash
-python benchmark.py -c output/<checkpoint_directory>/config.yaml
-```
-
-`benchmark.py` supports both the rasterizer and the ray tracer over the same set of power-diagram primitives:
-
-```bash
-# Rasterizer benchmark (default)
-python benchmark.py -c output/<checkpoint_directory>/config.yaml
-
-# Ray tracer benchmark (uses adjacency-walk ray traversal)
-python benchmark.py -c output/<checkpoint_directory>/config.yaml --render_type raytrace
-```
-
-## Viewer
-
-```bash
-python view.py -c output/<checkpoint_directory>/config.yaml
-```
-
-The viewer can also be attached *during* training by passing `--viewer` to `train.py` — the training loop pauses cleanly while the renderer holds the state lock so you can inspect convergence in real time.
-
-## Important flags reference
-
-| Flag                    | Default       | Description                                                                                                                                                |
-| ----------------------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--is_pinhole`          | `False`*      | When `True`, use the fast pinhole rasterizer. The standard configs ship with `is_pinhole: true`. **Set to `False` for fisheye / distorted cameras.**       |
-| `--use_metric3d`        | `False`       | Pre-compute / load Metric3D depth + normals into the dataset. Required to use Metric3D normals as supervision.                                             |
-| `--normal_supervision`  | `False`       | Enable external normal supervision. Combine with `--use_metric3d True` for Metric3D normals; otherwise uses finite-difference normals from rendered depth. |
-| `--eval`                | `False`       | Use `train`/`test` splits. When `False`, the loader uses all views as `all`.                                                                               |
-| `--viewer`              | `False`       | Launch the interactive viewer alongside training.                                                                                                          |
-| `--dry_run`             | `False`       | Don't write any checkpoints or TensorBoard events.                                                                                                         |
-| `--experiment_name`     | random uuid   | Subdirectory name under `output/`.                                                                                                                         |
-| `--render_type`         | `rasterize`   | (`benchmark.py` only) `rasterize` or `raytrace`.                                                                                                           |
-
-*`Params.is_pinhole` defaults to `False` in code, but every shipped yaml overrides it to `True` because the standard datasets use pinhole models. Override on the CLI if you need otherwise.
-
-### Flag combinations for normal supervision
-
-| `normal_supervision` | `use_metric3d` | What happens                                                                        |
-| -------------------- | -------------- | ----------------------------------------------------------------------------------- |
-| False (default)      | any            | Only the renderer's internal `normal_err` term — no external normals are consulted. |
-| True                 | False          | External target = finite-difference normals from the rendered median-depth map.     |
-| True                 | True           | External target = Metric3D predicted normals.                                       |
-
-When `--normal_supervision` is on, training also evaluates the rendered depth map at the median quantile (`0.5`) so the bilateral / FD path or the validity mask can be computed.
-
-## SurfaceFoam: occupancy-MLP guided Voronoi-walk surface reconstruction (new)
-
-`SurfaceFoam` is an additional algorithm built on top of Power Foam's Voronoi/Cech-complex ray walk.
-Instead of volumetric densities it learns an **occupancy MLP** `o(x) in [0,1]` and the reconstructed
-surface *is* a set of Voronoi faces, so a closed polygonal mesh is read off the diagram directly
-(no TSDF fusion / marching cubes).
-
-**Per ray**
-
-1. *Voronoi walk* (Warp kernel `voronoi_walk_kernel`): the ray is walked cell by cell through the diagram
-   (`s_0, s_1, ...`); the ray crosses the bisector of `(s_k, s_{k+1})` at the intersection `x_k`.
-2. Every visited site gets an occupancy `MLP(site position)`.  The first consecutive pair with
-   occupancy going from `< 0.5` to `>= 0.5` defines the **surface**: their bisector is a mesh face and its
-   intersection with the ray is `x_m`.
-3. Around `x_m`, `K_b in [2,5]` intersections before and `K_a in [2,5]` after it are collected
-   (`x_{m-K_b} .. x_{m+K_a}`).  The MLP is evaluated at the *intersection coordinates*; the occupancy is
-   used as opacity `alpha_k = MLP(x_k)` and colours are alpha-composited as in UNISURF:
-   `C = sum_k alpha_k prod_{j<k} (1-alpha_j) c_k` (colour of an intersection = mean of the two
-   sites' view-dependent SH colours).  Rays without a surface crossing (initialisation, empty space)
-   composite `W` intersections spread over the walked path, which bootstraps / carves the occupancy.
-
-**Losses and gradient routing** (checked by `tests/test_surface_foam.py`)
-
-| loss | definition | gradient goes to |
-| --- | --- | --- |
-| colour | MSE of the composited colour | MLP weights + site colours only |
-| normal | for the two sites `(a,b)` holding the surface bisector, `p_b - p_a` must be parallel to the MLP normal `grad_x o` at `x_m` (smoothed over a few jittered points) | site positions only |
-| intersection occupancy | `o(x_m) = 0.5` for the ray/bisector intersection of the surface face | site positions only (MLP frozen) |
-
-**Surface-weighted compositing.** As in UNISURF the colour of the intersection whose bisector is the
-surface (`x_m`) must dominate: its opacity is boosted, `alpha_m <- alpha_m + (1-alpha_m) * surface_boost`
-(default 0.5), which guarantees `w_m = alpha_m T_m >= 0.5 T_m >= w_k` for every later intersection `k > m`
-(`surface_boost: 0` disables it).  The training log reports `surf_max`, the fraction of crossing rays
-where `x_m` has the largest weight.
-
-**Rays without a surface (background / free space), from UNISURF.**  UNISURF needs no mask: rays without
-a root use stratified samples on the *whole* ray (coarse volume rendering, so the colour loss carves the
-occupancy to 0), and rays with a surface additionally get random samples between the camera and the surface
-("free-space" samples) which reduce floaters.  Here: rays without a crossing composite
-`free_samples + 2 win_max + 1` intersections spread uniformly over the walked path; rays with a crossing
-get `free_samples` stratified intersections between the camera and the local window, which enter the
-transmittance (any occupancy in front of the surface hides it and is penalised by the colour loss).
-Training rays use a random background colour.
-
-**Sphere initialisation (SAL adapted to occupancy)** (`OccupancyMLP.init_sphere`, `init_sphere: 1`).
-SAL (Atzmon & Lipman, Thm. 1) sets `b=0`, `W ~ N(0, sqrt(2)/sqrt(d_out))`, `w = sqrt(pi)/sqrt(d_out) 1`,
-`c = -r`, so that `f(x) ~ |x| - r` (SDF of a sphere; `E[w . relu(Wx)] = |x|`).  An occupancy is the sigmoid
-of a *logit*, so the logit takes the role of the (sign-flipped, scaled) SDF:
-`logit(x) = -kappa f(x) = kappa (r - |x|)`, `o = sigmoid(logit)` (1 inside, 0 outside, `o = 0.5` on the
-sphere, `|grad o| = kappa/4`, `grad o/|grad o| = -x/|x|`), i.e. `w = -kappa sqrt(pi)/sqrt(d_out) 1`,
-`c = +kappa r` (with `coord_scale s`: `kappa' = kappa/s`).  As in IDR/VolSDF the first layer only sees the raw
-coordinates (Fourier channels start at zero and are switched on by the BARF annealing).  Because the theorem is
-asymptotic in the width (and for ReLU), the output layer is then refined by a closed-form weighted ridge fit
-(shrunk towards the SAL solution) to `kappa (r - |x|)`; this gives radius `0.50 +- 0.01`, `|grad logit| ~ kappa`,
-normal vs. `-x/|x|` cosine 0.999 with the default 128x4 softplus MLP.  The MLP learning rate is warmed up
-(`mlp_warmup`) so that the first Adam steps do not destroy the sphere.  Set `sphere_radius` to the object
-radius (`init_sphere: 0` disables it).
-
-**Surface smoothness** (`SurfaceFoam.mlp_regularization`, gradients reach the MLP only).
-* UNISURF's surface regulariser `|| n(x_s) - n(x_s + eps) ||_2` (`smooth_weight`, `smooth_eps` x local site
-  spacing, optionally decayed with `smooth_final_frac`) at the ray/bisector intersections.
-* SDFoam's eikonal term adapted to the occupancy (`eik_weight`, `sharp_lr`): `(|grad f| / kappa - 1)^2` with
-  `logit = exp(log_sharp) f` and a learnable sharpness (SDFoam's beta).  On lego it *hurt* (PSNR -2 dB, see the
-  ablation), so it is off by default.
-* The Voronoi-face mesh can additionally be projected onto the MLP level set (`python test_surface.py ... --snap`),
-  and `--mc` / `mc_res` extracts a marching-cubes reference mesh of the MLP (`mc_mesh.ply`);
-  `--roughness` prints the normal roughness (mean angle between a surface normal and the mean normal within
-  3 cm) of every mesh.
-
-**Densification** (every `resample_interval` iterations, `SurfaceFoam.resample` / `error_surface_pairs`):
-
-1. render random training rays and keep the per-ray colour error;
-2. UNISURF root finding on the MLP along those rays (`root_samples` samples, first `<0.5 -> >=0.5`
-   bracket, `root_steps` secant/bisection steps) gives `x*` with `o(x*) = 0.5`;
-3. hits are sampled proportionally to the error with a spatial non-maximum suppression (`densify_nms`);
-4. at each `x*` with MLP normal `n` two sites are added, `x* + delta n` and `x* - delta n`
-   (`delta = densify_offset` x local site spacing), so that their bisector passes through `x*` with normal `n`;
-5. the SH colours of the new sites are copied (inverse-distance weighted) from the `copy_knn` nearest existing sites.
-
-Low-contribution sites are pruned first; if too few surface hits are found the remaining budget is filled
-by jittered duplicates of high-error sites.  The adjacency used by the walk is the union of a GPU Cech complex and exact
-Delaunay edges (kNN-radius Cech alone loses rays after densification, see `rebuild_adjacency`).
-
-```bash
-python train_surface.py -c configs/surface_lego.yaml            # train, evaluate, export mesh
-python test_surface.py  -c output/lego_surface/config.yaml      # re-evaluate / re-export mesh
-python tests/test_surface_foam.py                               # unit tests (walk, grads, compositing)
-```
-
-Outputs in `output/<experiment>/`: `model.pt`, `metrics.txt`, `test/*.png` (render | gt | normal | depth),
-`surface_mesh.ply` (Voronoi-face mesh, vertex colours) and `surface_mesh_preview.png`.
-Implementation: `powerfoam/surface_foam.py`, `powerfoam/surface_mesh.py`, `powerfoam/ray_bank.py`,
-`SurfaceParams` in `configs/__init__.py`.
-
-## BibTeX
-
-```bibtex
-@article{govindarajan2026powerfoam,
-  title   = {Power Foam: Unifying Real-Time Differentiable Ray Tracing and Rasterization},
-  author  = {Govindarajan, Shrisudhan and Rebain, Daniel and Verbin, Dor and
-             Yi, Kwang Moo and Prabhu, Anish and Tagliasacchi, Andrea},
-  journal = {arXiv},
-  year    = {2026},
-}
-```
+Power Foam (Govindarajan et al.) and Radiant Foam; VoroTracing (Taveira et al.) for the octahedral textures,
+exponential density, distortion loss and the low-contribution skip. See `LICENSE`.

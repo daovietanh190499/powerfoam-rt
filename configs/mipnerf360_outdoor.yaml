@@ -22,7 +22,7 @@ bkgd_color: [0.0, 0.0, 0.0]
 # Optimization parameters
 points_lr_init: 1e-3
 points_lr_final: 1e-4
-density_lr_init: 1e0
-density_lr_final: 1e0
+density_lr_init: 1e-1
+density_lr_final: 1e-2
 radii_lr_init: 1e-4
 radii_lr_final: 1e-5
